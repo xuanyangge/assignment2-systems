@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import torch.cuda.nvtx as nvtx
 import warnings
 
 import einx
@@ -379,11 +380,24 @@ class TransformerBlock(nn.Module):
         # NOTE: this is a pre-norm Transformer, and differs from the original
         # description in the paper.
         # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
+
+        with nvtx.range("rms1"):
+            soft_maxed_x = self.ln1(x)
+
+        with nvtx.range("attn"):
+            x_attn = self.attn(soft_maxed_x)
+        
         attn_sublayer_output = x + x_attn
 
+
+
         # Apply the feed-forward sublayer
-        x_ffn = self.ffn(self.ln2(attn_sublayer_output))
+        with nvtx.range("rms2"):
+            soft_maxed_sublayer = self.ln2(attn_sublayer_output)
+
+        with nvtx.range("ffn"):
+            x_ffn = self.ffn(soft_maxed_sublayer)
+
         ffn_sublayer_output = attn_sublayer_output + x_ffn
         return ffn_sublayer_output
 
@@ -424,15 +438,19 @@ def scaled_dot_product_attention(
     """
 
     d_k = K.shape[-1]
-    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+    with nvtx.range("QK mutmul"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
     if mask is not None:
         attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+    with nvtx.range("softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
 
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    with nvtx.range("v_mul"):
+        res =  einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
+    return res
 
 class CausalMultiHeadSelfAttention(nn.Module):
     """Multi-Head Self-Attention

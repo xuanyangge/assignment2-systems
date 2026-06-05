@@ -2,6 +2,10 @@
 cs336-spring2024-assignment-2-submission.zip
 test_results.xml
 
+# Nsight Systems profiler outputs
+*.nsys-rep
+*.sqlite
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
