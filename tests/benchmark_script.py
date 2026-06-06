@@ -9,6 +9,7 @@ from cs336_basics.nn_utils import cross_entropy
 import timeit
 from cs336_basics.optimizer import AdamW
 import torch.cuda.nvtx as nvtx
+from contextlib import nullcontext
 
 def parse_args():
     p = argparse.ArgumentParser(description="LLM training loop")
@@ -50,6 +51,9 @@ def parse_args():
     p.add_argument("--mode", type=int, default = 0)
 
     p.add_argument("--rope_theta", type=float, default=10000)
+    p.add_argument("--use_mixed_precision", default=False, action="store_true")
+    p.add_argument("--store_memory_trace", default=False, action="store_true")
+    p.add_argument("--trace_postfix", type=str, default="")
     return p.parse_args()
 
 
@@ -76,15 +80,20 @@ def generate_random_batch(args):
     return (seq[:, :-1], seq[:,1:])
 
 def run_test_operation(args, model, random_batch, optimizer):
+    ctx = torch.autocast(device_type=args.device, dtype=torch.bfloat16) if args.use_mixed_precision else nullcontext()
     if args.mode == 0:
-        model(random_batch[0])
+        with ctx:
+            model(random_batch[0])
     elif args.mode == 1:
-        logits = model(random_batch[0])
+        with ctx:
+            logits = model(random_batch[0])
         loss = cross_entropy(logits, random_batch[1])
         loss.backward()
         model.zero_grad()
     elif args.mode == 2:
-        logits = model(random_batch[0])
+        
+        with ctx:
+            logits = model(random_batch[0])
         loss = cross_entropy(logits, random_batch[1])
         loss.backward()
         optimizer.step()
@@ -109,19 +118,29 @@ def main():
         run_test_operation(args, model, random_batch, optimizer)
 
     torch.cuda.synchronize()  
+    if args.store_memory_trace:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
     times = []
-    for i in range(args.iters):
-        with nvtx.range("step"):
-            torch.cuda.synchronize()
-            start = timeit.default_timer()  
-            run_test_operation(args, model, random_batch, optimizer)
-            torch.cuda.synchronize()
-            end = timeit.default_timer()    
-            elapsed = end - start
-            times.append(elapsed)
-    
+
+    with torch.autograd.profiler.emit_nvtx():
+        for i in range(args.iters):
+            with nvtx.range("step"):
+                torch.cuda.synchronize()
+                start = timeit.default_timer()  
+                run_test_operation(args, model, random_batch, optimizer)
+                torch.cuda.synchronize()
+                end = timeit.default_timer()    
+                elapsed = end - start
+                times.append(elapsed)
+        
     print(f"average {np.mean(times)*1000:.2f} ms/step")
     print(f"std {np.std(times, ddof=1)*1000:.2f} ms/step")
+    # Save a pickle file to be loaded by PyTorch's online tool.
+    if args.store_memory_trace:
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle" + args.trace_postfix)
+        # Stop recording history.
+        print("peak memory: ", torch.cuda.max_memory_allocated())
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 if __name__ == "__main__":
     main()

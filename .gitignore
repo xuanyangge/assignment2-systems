@@ -6,6 +6,13 @@ test_results.xml
 *.nsys-rep
 *.sqlite
 
+# Pickle files
+*.pickle
+*.pkl
+
+# CUDA memory snapshots
+memory_snapshot.pickle*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
