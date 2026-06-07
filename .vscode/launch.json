@@ -1,0 +1,24 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Triton (interpret)",
+      "type": "debugpy", "request": "launch", "module": "pytest",
+      "args": ["tests/test_attention.py::test_flash_forward_pass_triton[False]", "-s"],
+      "env": { "TRITON_INTERPRET": "1" },
+      "console": "integratedTerminal", "justMyCode": false
+    },
+    {
+      "name": "Debug PyTorch tiled",
+      "type": "debugpy", "request": "launch", "module": "pytest",
+      "args": ["tests/test_attention.py::test_flash_forward_pass_pytorch[False]", "-s"],
+      "console": "integratedTerminal", "justMyCode": false
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Compare both",
+      "configurations": ["Debug Triton (interpret)", "Debug PyTorch tiled"]
+    }
+  ]
+}
