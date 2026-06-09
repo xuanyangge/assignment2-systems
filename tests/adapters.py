@@ -5,6 +5,8 @@ import triton
 import math
 import triton.language as tl
 import einops
+import torch.nn as nn
+import torch.distributed as dist
 
 def custom_cdiv(a, b):
     if a % b == 0:
@@ -95,11 +97,23 @@ class flashAttention(torch.autograd.Function):
         return O_with_batch
 
 
+class ddp(nn.Module):
+    def __init__(self, module:torch.nn.Module):
+        super().__init__()
+        self.module = module
+        return 
     
-    @staticmethod
-    def backward(ctx):
-        raise NotImplementedError
-
+    def forward(self, data):
+        return self.module(data)
+    
+    def backward(self):
+        self.module.backward()
+    
+    def finish_gradient_synchronization(self):
+        for param in self.module.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=False)
+        
 class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_casual=False):
@@ -126,10 +140,12 @@ class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
             N_q, N_k,
             math.sqrt(D),
             D,
-            q_tile_size, k_tile_size
+            q_tile_size, k_tile_size,
+            is_causal= is_casual
         )
         
         ctx.save_for_backward(Q, K, V, O, L)
+        ctx.is_casual = is_casual
         return O
     
     def backward(ctx):
@@ -169,6 +185,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -202,14 +219,11 @@ def flash_fwd_kernel(
         order=(0,)
     )
 
-    t_k = D // Q_TILE_SIZE
-
     q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
     prev_o = tl.zeros((Q_TILE_SIZE, D) , dtype= tl.float32)
     prev_l = tl.zeros((Q_TILE_SIZE,) , dtype= tl.float32)
     prev_m = tl.full((Q_TILE_SIZE,), float("-inf"), dtype = tl.float32)
     
-    tl.device_print("q_i", q_i)
     K_block_ptr = tl.make_block_ptr(
         K_ptr + batch_index * stride_kb,
         shape=(N_KEYS, D),
@@ -228,11 +242,19 @@ def flash_fwd_kernel(
         order=(1, 0)
     )
 
-    for j in range(tl.cdiv(D, K_TILE_SIZE)):
+    for j in range(tl.cdiv(N_QUERIES, K_TILE_SIZE)):
         k_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         v_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         s_j = tl.dot(q_i, tl.trans(k_j)) / scale
-        
+
+        if is_causal:
+            q_inds = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            k_inds = j * K_TILE_SIZE  + tl.arange(0, K_TILE_SIZE)
+            mask = q_inds[:, None] >= k_inds[None, :]
+            # i span from quer
+            s_j = tl.where(mask, s_j, s_j-1e6)
+
+
         row_max = tl.max(s_j, axis = 1)
 
         if j == 0:
@@ -264,7 +286,7 @@ def flash_fwd_kernel(
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     
 
-    tl.store(O_block_ptr, prev_o * (1 / prev_l)[:, None], boundary_check=(0, 1))
+    tl.store(O_block_ptr, prev_o * ((1 / prev_l)[:, None]), boundary_check=(0, 1))
     tl.store(L_block_ptr, prev_m + tl.log(prev_l))
 
 
@@ -315,7 +337,10 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
         Instance of a DDP class.
     """
     # For example: return DDP(module)
-    raise NotImplementedError
+    for p in module.parameters():
+        dist.broadcast(p.data, src=0)
+        
+    return ddp(module)
 
 
 def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -329,8 +354,7 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    ddp_model.finish_gradient_synchronization()
 
 
 def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> torch.nn.Module:
