@@ -110,8 +110,19 @@ class ddp(nn.Module):
         self.module.backward()
     
     def finish_gradient_synchronization(self):
-        for param in self.module.parameters():
-            if param.grad is not None:
+        # for i, (name, param) in enumerate(self.module.named_parameters()):
+        #     print(
+        #         f"[rank {dist.get_rank()}] idx {i} name={name} "
+        #         f"requires_grad={param.requires_grad} grad_is_none={param.grad is None}",
+        #         flush=True,
+        #     )
+
+        #     # ... your existing all_reduce logic ...
+
+        for i, param in enumerate(self.module.parameters()):
+            print(f"[rank {dist.get_rank()}] reduce idx {i} grad_is_none={param.grad is None}", flush=True)
+            if param.grad is not None:    
+                print(f"[rank {dist.get_rank()}] grad device = {param.grad.device}", flush=True)
                 dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=False)
         
 class MyTritonFlashAttentionAutogradFunctionClass(torch.autograd.Function):
