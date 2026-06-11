@@ -1,6 +1,5 @@
 from typing import Any
-from builtins import Type
-from __future__ import annotations
+from builtins import type
 
 import torch
 import triton
@@ -367,7 +366,8 @@ class ddp_overlap_individual_parameteres(nn.Module):
         self.handles = []
         # call register_post_accumulate_grad_hook
         for p in self.module.parameters():
-            p.register_post_accumulate_grad_hook(self._post_accumulate_grad_hook)
+            if p.requires_grad:
+                p.register_post_accumulate_grad_hook(self._post_accumulate_grad_hook)
 
         return
 
@@ -408,7 +408,7 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
     for p in module.parameters():
         dist.broadcast(p.data, src=0)
 
-    return ddp(module)
+    return ddp_overlap_individual_parameteres(module)
 
 
 def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -480,8 +480,8 @@ def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tens
 # 4. all gatehr the parametesr.
 
 
-class StateSharingOptimizer:
-    def __init__(self, params, optimizer_cls: Type[torch.optim.Optimizer], **kwargs: Any):
+class StateSharingOptimizer(torch.optim.Optimizer):
+    def __init__(self, params, optimizer_cls, **kwargs: Any):
         # Initializes the sharded state optimizer. params is a collection of parameters to be optimized (or parameter
         # groups, in case the user wants to use different hyperparameters, such as learning rates, for
         # different parts of the model); these parameters will be sharded across all the ranks. The
@@ -489,22 +489,41 @@ class StateSharingOptimizer:
         # Finally, any remaining keyword arguments are forwarded to the constructor of the
         # optimizer_cls. Make sure to call the torch.optim.Optimizer super-class constructor in this
         # method.
-        self.optimizer = optimizer_cls(params, **kwargs)
-        self.param = params
-        raise NotImplementedError
+        self.optimizer_cls = optimizer_cls
+        self.kwargs = kwargs
+        self.param_groups_cnt = 0
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+        self.optimizer = None
+        super().__init__(params, kwargs)
 
-    def step(self, closure, **kwargs):
+    def step(self, closure=None, **kwargs):
         # Calls the wrapped optimizer’s step() method with the
         # provided closure and keyword arguments. After updating the parameters, synchronize with the
         # other ranks
-        raise NotImplementedError
+        if self.optimizer is not None:
+            self.optimizer.step(closure, **kwargs)
+
+        for param_group in self.param_groups:
+            for i, param in enumerate(param_group["params"]):
+                src = i % self.world_size
+                dist.broadcast(param.data, src=src)
 
     def add_param_group(self, param_group):
         # This method should add a parameter group to the sharded optimizer. This is called during construction of the sharded optimizer by
         # the super-class constructor and may also be called during training (e.g., for gradually
         # unfreezing layers in a model). As a result, this method should handle assigning the model’s
         # parameters among the ranks.
-        raise NotImplementedError
+        super().add_param_group(param_group)
+
+        for i, param in enumerate(param_group["params"]):
+            if i % self.world_size != self.rank:
+                continue
+            
+            if self.optimizer is None:
+                self.optimizer = self.optimizer_cls([param], **self.kwargs)
+            else:
+                self.optimizer.add_param_group({"params":param})
 
 
 def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
@@ -523,4 +542,4 @@ def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return StateSharingOptimizer(params, optimizer_cls, **kwargs)
