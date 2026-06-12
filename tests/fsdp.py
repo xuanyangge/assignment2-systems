@@ -8,19 +8,98 @@ import triton.language as tl
 import einops
 import torch.nn as nn
 import torch.distributed as dist
+from cs336_basics.model import Embedding, Linear, RMSNorm
 
 
 class FSDPContainer(torch.nn.Module):
     def __init__(self, module: torch.nn.Module, compute_dtype: torch.dtype | None = None):
         super().__init__()
-        self.module = module
         self.compute_dtype = compute_dtype
-        self._hooks = []
-        # Only gather the layer two before the current one has completed its forward pass.
+        self.layers = []
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+        self.current_gather_layer = 0
+        self.gathered_layer_weights = {}
+        self.workers = {}
+
+        for layer in module.modules():
+            if isinstance(layer, Linear):
+                d_out, d_in = layer.weight.shape
+                assert(d_out % self.world_size == 0) 
+                slice_size = d_out // self.world_size
+                sliced_layer = Linear(d_in, slice_size)
+                sliced_layer.weight = layer.weight[slice_size * self.rank + reminder: slice_size * (self.rank + 1) + reminder, :].to(compute_dtype)
+                
+                self.layers.append(sliced_layer)
+            elif isinstance(layer, Embedding):
+                vocab, d_model = layer.weight.shape
+                reminder = vocab % self.world_size
+                
+
+                # we could refactor this but meh.
+                if self.rank < reminder:
+                    slice_size  = vocab // self.world_size + 1
+                    sliced_layer = Embedding(slice_size, d_model)
+                    sliced_layer.weight = layer.weight[slice_size * self.rank: slice_size * (self.rank + 1), :].to(compute_dtype)
+
+                else: 
+                    slice_size = d_in // self.world_size
+                    sliced_layer = Embedding(slice_size, d_model)
+                    sliced_layer.weight = layer.weight[slice_size * self.rank + reminder: slice_size * (self.rank + 1) + reminder, :].to(compute_dtype)
+                
+                self.layers.append(sliced_layer)
+            else:
+                self.layers.append(layer)
+
+    def resetForwardState(self):
+        self.current_gather_layer = 0
+        self.gathered_layer_weights = {}
+        self.workers = {}
+
+    def enqueueAllGather(self):
+        while self.current_gather_layer < len(self.layers):
+            i = self.current_gather_layer
+            if isinstance(self.layers[i], (Linear, Embedding)): 
+                self.gathered_layer_weights[i] = []
+                worker = dist.all_gather(self.gathered_layer_weights[i], self.layers[i].weight, async_op=True)
+                self.workers[i] = worker
+                break
+            else:
+                self.current_gather_layer +=1
+
+
+    # How would backward work in this case? If the intermediate created layers are destoryed? 
 
     def forward(self, *inputs, **kwargs):
-        return self.module(*inputs, **kwargs)
+        self.resetForwardState()
 
+        look_ahead = 2
+        for _ in range(look_ahead):
+            self.enqueueAllGather()
+        res = inputs
+
+        for i, layer in enumerate(self.layers):
+            self.enqueueAllGather()
+            
+            self.workers[i].wait()
+            updated_layer = layer
+            if isinstance(self.layers[i], Linear):
+                gradients_flattend = torch.cat(self.gathered_layer_weights[i], dim=0)
+                updated_layer = Linear(gradients_flattend.shape[1], gradients_flattend.shape[0])
+                updated_layer.weight = gradients_flattend
+            elif isinstance(self.layers[i], Embedding):
+                gradients_flattend = torch.cat(self.gathered_layer_weights[i], dim=0)
+                updated_layer = Embedding(gradients_flattend.shape[0], gradients_flattend.shape[1])
+                updated_layer.weight = gradients_flattend
+            
+            if i in self.gathered_layer_weights:
+                self.gathered_layer_weights.clear(i)
+                self.workers.clear(i)
+
+            res = updated_layer(*res, **kwargs)
+
+        return res 
+    
     def finish_gradient_synchronization(self):
         for hook in self._hooks:
             hook()
