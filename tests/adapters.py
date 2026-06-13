@@ -5,9 +5,11 @@ import torch
 import triton
 import math
 import triton.language as tl
+from cs336_basics.model import Embedding, Linear, RMSNorm
 import einops
 import torch.nn as nn
 import torch.distributed as dist
+from .fsdp import FSDPContainer
 
 
 def custom_cdiv(a, b):
@@ -441,7 +443,7 @@ def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) 
         Instance of an FSDP class.
     """
     # For example: return FSDP(module, compute_dtype=compute_dtype)
-    raise NotImplementedError
+    return FSDPContainer(module=module, compute_dtype=compute_dtype)
 
 
 def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -456,7 +458,7 @@ def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.O
             Optimizer being used with the FSDP-wrapped model.
     """
     # For example: fsdp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    fsdp_model.finish_gradient_synchronization()
 
 
 def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -470,8 +472,29 @@ def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tens
     Returns:
         State dictionary mapping parameter names to full (unsharded) tensors.
     """
-    raise NotImplementedError
+    layer_res_buffer = {} 
+    world_size = dist.get_world_size()
+    workers = []
+    
+    worker_names = []
+    for mod_name, mod in fsdp_model.module.named_modules():
+        for p_name, p in mod.named_parameters(recurse=False):
+            full_name = f"{mod_name}.{p_name}"
+            if isinstance(mod, (Linear, Embedding)):
+                output = [torch.empty_like(p) for _ in range(world_size)]
+                full_name = f"{mod_name}.weight"
+                layer_res_buffer[full_name] = output
+                workers.append(dist.all_gather(output, p, async_op=True))
+                worker_names.append(full_name)
+            else:
+                layer_res_buffer[full_name] = p
+    
+    [worker.wait() for worker in workers]
+    
+    for key in worker_names:
+        layer_res_buffer[key] = torch.cat(layer_res_buffer[key], dim=0)
 
+    return layer_res_buffer
 
 # ZERO stage
 # 1.Computes full graident on their subset of the batch

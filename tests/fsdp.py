@@ -6,103 +6,143 @@ import triton
 import math
 import triton.language as tl
 import einops
+from einops import einsum, rearrange
 import torch.nn as nn
+from functools import partial
 import torch.distributed as dist
 from cs336_basics.model import Embedding, Linear, RMSNorm
+from enum import StrEnum
 
+class LayerType(StrEnum):
+    LINEAR = "linear"
+    EMBEDDING = "embedding"
+    OTHERS = "other"
+
+# Don't forget to go over dtypes.
 
 class FSDPContainer(torch.nn.Module):
     def __init__(self, module: torch.nn.Module, compute_dtype: torch.dtype | None = None):
         super().__init__()
         self.compute_dtype = compute_dtype
-        self.layers = []
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
-        self.current_gather_layer = 0
-        self.gathered_layer_weights = {}
+
         self.workers = {}
+        self.gathered_layer_weights = {}
+        self.gradient_buffer = {}
 
-        for layer in module.modules():
-            if isinstance(layer, Linear):
-                d_out, d_in = layer.weight.shape
-                assert(d_out % self.world_size == 0) 
-                slice_size = d_out // self.world_size
-                sliced_layer = Linear(d_in, slice_size)
-                sliced_layer.weight = layer.weight[slice_size * self.rank + reminder: slice_size * (self.rank + 1) + reminder, :].to(compute_dtype)
-                
-                self.layers.append(sliced_layer)
-            elif isinstance(layer, Embedding):
-                vocab, d_model = layer.weight.shape
-                reminder = vocab % self.world_size
-                
-
-                # we could refactor this but meh.
-                if self.rank < reminder:
-                    slice_size  = vocab // self.world_size + 1
-                    sliced_layer = Embedding(slice_size, d_model)
-                    sliced_layer.weight = layer.weight[slice_size * self.rank: slice_size * (self.rank + 1), :].to(compute_dtype)
-
-                else: 
-                    slice_size = d_in // self.world_size
-                    sliced_layer = Embedding(slice_size, d_model)
-                    sliced_layer.weight = layer.weight[slice_size * self.rank + reminder: slice_size * (self.rank + 1) + reminder, :].to(compute_dtype)
-                
-                self.layers.append(sliced_layer)
+        self.layers = nn.ModuleList([])
+        self.non_shard_params = []
+        self.gatherable_inds = []
+        self.layer_subweights = {}
+        self.module = module
+        for i, layer in enumerate(module.modules()):
+            if isinstance(layer, (Linear, Embedding)):
+                self.store_subweight(i, layer)
+                layer.register_forward_pre_hook(partial(self._all_gather_prehook, i))
+                layer.register_forward_hook(partial(self._forward_hook, i))
+                layer.register_full_backward_pre_hook(partial(self._all_gather_prehook, i))
+                layer.register_full_backward_hook(partial(self._backward_hook, i))
+                layer.weight.register_post_accumulate_grad_hook(partial(self._grad_hook, i))
+                self.gatherable_inds.append(i)
             else:
-                self.layers.append(layer)
+                for p in layer.parameters(recurse=False):
+                    self.non_shard_params.append(p)
+
+            self.layers.append(layer)
+    
+    def store_subweight(self, ind, layer: torch.nn.Module):
+        d_out, d_in = layer.weight.shape
+        assert(d_out % self.world_size == 0) 
+        slice_size = d_out // self.world_size
+        layer.weight.data =  layer.weight[slice_size * self.rank: slice_size *(self.rank +1), : ].clone()
+
+        # if self.compute_dtype is not None:
+        #     layer.weight.data =  sliced_data.to(self.compute_dtype)
+        # else:
+        #     layer.weight.data = sliced_data
+
+        self.layer_subweights[ind] = layer.weight.data
+
+    def all_gather_worker(self, idx):
+        subweight = self.layer_subweights[idx]
+        output = [torch.empty_like(subweight, dtype=self.compute_dtype) for _ in range(self.world_size)]
+        self.gathered_layer_weights[idx] = output
+        if self.compute_dtype is not None:
+            subweight = subweight.to(self.compute_dtype)
+            
+        return dist.all_gather(self.gathered_layer_weights[idx], subweight, async_op=True)
+
+    def _all_gather_prehook(self, idx, module, args):
+        if idx in self.workers:
+            self.workers[idx].wait()
+            self.workers.pop(idx)
+        else:
+            self.all_gather_worker(idx).wait()
+
+        module.weight.data = torch.cat(self.gathered_layer_weights[idx], dim = 0)
+        self.gathered_layer_weights.pop(idx)
+
+    
+    def _forward_hook(self, idx, module, args, output):
+        module.weight.data = self.layer_subweights[idx]
+        gather_ind = self.gatherable_inds.index(idx)
+
+        gather_ahead = 2
+        for i in range(1, gather_ahead + 1):
+            if i + gather_ind >= len(self.gatherable_inds):
+                break
+            
+            next_ind = self.gatherable_inds[i + gather_ind]
+            self.workers[next_ind] = self.all_gather_worker(next_ind)
+
+
+    def _backward_hook(self, idx, module, args, output):
+        module.weight.data = self.layer_subweights[idx]
+        gather_ind = self.gatherable_inds.index(idx)
+
+        gather_back = 2
+        for i in range(1, gather_back + 1):
+            if gather_ind - i < 0:
+                break
+            
+            next_ind = self.gatherable_inds[gather_ind - i]
+            self.workers[next_ind] = self.all_gather_worker(next_ind)
+
+    def _grad_hook(self, idx, tensor):
+        output = torch.empty((tensor.grad.shape[0] // self.world_size, tensor.grad.shape[1]), dtype=torch.float32)
+        worker = dist.reduce_scatter_tensor(output, tensor.grad.to(torch.float32), op= dist.ReduceOp.AVG, async_op=True)
+        self.gradient_buffer[idx] = (worker, output, tensor)
+
 
     def resetForwardState(self):
-        self.current_gather_layer = 0
         self.gathered_layer_weights = {}
         self.workers = {}
-
-    def enqueueAllGather(self):
-        while self.current_gather_layer < len(self.layers):
-            i = self.current_gather_layer
-            if isinstance(self.layers[i], (Linear, Embedding)): 
-                self.gathered_layer_weights[i] = []
-                worker = dist.all_gather(self.gathered_layer_weights[i], self.layers[i].weight, async_op=True)
-                self.workers[i] = worker
-                break
-            else:
-                self.current_gather_layer +=1
-
-
-    # How would backward work in this case? If the intermediate created layers are destoryed? 
+        self.gradient_buffer = {}
 
     def forward(self, *inputs, **kwargs):
         self.resetForwardState()
-
-        look_ahead = 2
-        for _ in range(look_ahead):
-            self.enqueueAllGather()
-        res = inputs
-
-        for i, layer in enumerate(self.layers):
-            self.enqueueAllGather()
-            
-            self.workers[i].wait()
-            updated_layer = layer
-            if isinstance(self.layers[i], Linear):
-                gradients_flattend = torch.cat(self.gathered_layer_weights[i], dim=0)
-                updated_layer = Linear(gradients_flattend.shape[1], gradients_flattend.shape[0])
-                updated_layer.weight = gradients_flattend
-            elif isinstance(self.layers[i], Embedding):
-                gradients_flattend = torch.cat(self.gathered_layer_weights[i], dim=0)
-                updated_layer = Embedding(gradients_flattend.shape[0], gradients_flattend.shape[1])
-                updated_layer.weight = gradients_flattend
-            
-            if i in self.gathered_layer_weights:
-                self.gathered_layer_weights.clear(i)
-                self.workers.clear(i)
-
-            res = updated_layer(*res, **kwargs)
-
-        return res 
+        return self.module(*inputs, **kwargs)
     
     def finish_gradient_synchronization(self):
-        for hook in self._hooks:
-            hook()
+        [handle.wait() for handle, _, _ in self.gradient_buffer.values()]
+
+        for _, output, tensor in self.gradient_buffer.values():
+            tensor.grad = output
+        
+        gradients = []
+        for p in self.non_shard_params:
+            if p.grad is not None:
+                gradients.append(p.grad)
+
+        #gradients = [p.grad for p in self.module.parameters() if p.grad is not None]
+        
+        gradients_flattend = torch._utils._flatten_dense_tensors(gradients)
+        dist.all_reduce(gradients_flattend, op=dist.ReduceOp.AVG, async_op=False)
+        gradients_reduced = torch._utils._unflatten_dense_tensors(gradients_flattend, gradients)
+
+        for i in range(len(gradients)):
+            gradients[i].copy_(gradients_reduced[i])
 
 
 # Problem (fsdp):  Fully-Sharded Data Parallel (15 points)
